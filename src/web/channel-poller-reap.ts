@@ -236,12 +236,23 @@ export function reapChannelOrphans(
   // (no remain-on-exit -> pane death takes the whole session with it). A
   // grandchild poller (the bun/node child under it) is NOT a pane leader and
   // stays a normal reap target, which is the whole point of reaping here rather
-  // than relying on respawn-pane -k alone. Fail-safe: if the live-pane query
-  // itself fails, live is empty and nothing is additionally spared (matches the
-  // pre-fix behavior rather than silently protecting more than intended).
+  // than relying on respawn-pane -k alone.
+  //
+  // Fail-SAFE, not fail-open (Logra's review, 2026-09-19, same card 08a02137):
+  // an empty `live` set means the tmux query itself failed (a real server
+  // always has at least one pane), not "nothing is live". Treating that as
+  // "nothing to protect" would silently reproduce the exact bug this function
+  // exists to fix. So an unresolved live-pane set aborts the kill entirely,
+  // mirroring reapDetachedChannelClaudes's own fail-safe (`live.size === 0` ->
+  // reap nothing) instead of contradicting it.
   const live = livePanePids(opts.tmuxPath ?? 'tmux')
-  const all = candidates.filter((pid) => !live.has(pid))
-  const skippedLivePane = candidates.filter((pid) => live.has(pid))
+  const liveQueryFailed = live.size === 0
+  const all = liveQueryFailed ? [] : candidates.filter((pid) => !live.has(pid))
+  const skippedLivePane = liveQueryFailed ? [] : candidates.filter((pid) => live.has(pid))
+  if (liveQueryFailed && candidates.length > 0) {
+    logger.warn({ provider, chanDir, candidates },
+      'channel-poller-reap: could not resolve live tmux panes, refusing to reap (fail-safe)')
+  }
 
   // SIGTERM, give bun/node ~300ms to flush, then SIGKILL stragglers.
   for (const pid of all) {
