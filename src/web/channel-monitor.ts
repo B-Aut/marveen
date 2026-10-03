@@ -72,6 +72,7 @@ import { getClaudePidForSession, hasChannelPluginAlive, probeChannelPluginLivene
 import { getDesiredAgents } from './agent-desired-state.js'
 import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
 import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
+import { isProtectedAgent, recordProtectedAgentEvent } from './protected-agents.js'
 
 // Lazily resolved (see makeLazyBinResolver): a module-level `resolveFromPath`
 // const throws at IMPORT time, so any environment where the binary is not
@@ -2738,10 +2739,34 @@ async function reconcileDesiredAgents(): Promise<void> {
       }
       if (isWithinRestartGrace(name)) continue
       if (!memGateAllowsStart(name)) continue   // Commit 3 v1: safe-mode / memory gate
-      logger.warn({ agent: name }, 'Desired agent not running -- auto-starting (reconcile)')
+      // A protected agent reaching this line did NOT go through the API (the
+      // guard in routes/agents.ts refuses stop and delete for it) and is not
+      // mid-managed-restart (isRestartInFlight / isWithinRestartGrace skipped
+      // those above). What is left is one of the six OS-level bypasses Péter
+      // accepted as open on card 2fd5bfae -- tmux kill-session, kill -9, tmux
+      // kill-server, rm -rf. We cannot prevent those here; the decision was
+      // that they must at least be named rather than restarted in silence,
+      // which is why this does not reuse the ordinary reconcile line.
+      const isProtected = isProtectedAgent(name)
+      if (isProtected) {
+        logger.error({ agent: name }, 'Protected agent disappeared from tmux unexpectedly -- restarting (out-of-band stop, not via the API)')
+      } else {
+        logger.warn({ agent: name }, 'Desired agent not running -- auto-starting (reconcile)')
+      }
       try {
         const r = await startAgentProcess(name)
         agentLastRestart.set(name, Date.now())
+        const started = r.ok || r.error === 'Agent is already running'
+        if (isProtected) {
+          recordProtectedAgentEvent({
+            agent: name,
+            action: 'out-of-band-disappearance',
+            outcome: started ? 'restarted' : 'restart-failed',
+            note: started
+              ? 'protected agent disappeared from tmux unexpectedly, restarted'
+              : `protected agent disappeared from tmux unexpectedly, restart FAILED: ${r.error ?? 'unknown error'}`,
+          })
+        }
         if (!r.ok && r.error !== 'Agent is already running') {
           logger.error({ agent: name, error: r.error }, 'Reconcile start failed')
         }

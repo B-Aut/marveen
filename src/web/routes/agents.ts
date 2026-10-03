@@ -117,6 +117,7 @@ import {
   delay,
 } from '../agent-process.js'
 import { addDesiredAgent, removeDesiredAgent } from '../agent-desired-state.js'
+import { describeApiCaller, isProtectedAgent, recordProtectedAgentEvent } from '../protected-agents.js'
 import { RemoteStatusCache } from '../remote-status-cache.js'
 import type { AgentRunState } from '../ssh-tmux.js'
 import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
@@ -2110,6 +2111,21 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       json(res, { error: 'Main agent lifecycle is service-managed; use /api/marveen/restart for recovery' }, 400)
       return true
     }
+    // Protected agents (card 2fd5bfae): refuse before anything mutates. The
+    // order is the whole point -- removeDesiredAgent() below runs
+    // unconditionally, so a guard placed after it would leave the agent
+    // running but no longer desired, i.e. unprotected on the next reconcile.
+    if (isProtectedAgent(name)) {
+      recordProtectedAgentEvent({
+        agent: name,
+        action: 'stop',
+        outcome: 'blocked',
+        source: describeApiCaller(ctx.auth, req.socket?.remoteAddress),
+        note: 'POST /stop refused by the protected-agents guard',
+      })
+      json(res, { error: 'Protected agent, önállóan nem állítható le' }, 400)
+      return true
+    }
     // Explicit stop clears intent so the monitor will not resurrect it -- and
     // it must happen BEFORE the stop yields. stopAgentProcess() now awaits ~2s
     // while the session settles; in that window the agent is already dead but
@@ -2477,6 +2493,29 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
   if (agentMatch && method === 'DELETE') {
     const name = decodeURIComponent(agentMatch[1])
+    // Both lifecycle guards run FIRST, before the directory check.
+    //
+    // Why before and not after: until now the main agent survived DELETE only
+    // as a structural accident -- agentDir(MAIN_AGENT_ID) does not exist, so
+    // the existsSync below 404s. That is not protection, it is a side effect
+    // that holds until someone creates the directory. A protected sub-agent
+    // (sentinel) HAS a directory, so for it the accident never applied at all:
+    // this route deleted it, dir and all, with no check whatsoever.
+    if (isMainChannelsAgent(name)) {
+      json(res, { error: 'Main agent lifecycle is service-managed; use /api/marveen/restart for recovery' }, 400)
+      return true
+    }
+    if (isProtectedAgent(name)) {
+      recordProtectedAgentEvent({
+        agent: name,
+        action: 'delete',
+        outcome: 'blocked',
+        source: describeApiCaller(ctx.auth, req.socket?.remoteAddress),
+        note: 'DELETE /api/agents/<name> refused by the protected-agents guard',
+      })
+      json(res, { error: 'Protected agent, önállóan nem törölhető' }, 400)
+      return true
+    }
     const dir = agentDir(name)
     if (!existsSync(dir)) { json(res, { error: 'Agent not found' }, 404); return true }
     // Clear the desired run-state FIRST, before anything yields. Deleting an
