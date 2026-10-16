@@ -13,6 +13,10 @@ and every request the script would send is recorded instead.
   - Without --confirm the run stops (3) and names the file, its size in bytes and its sha256.
   - With --confirm the request is multipart/form-data: the three post fields and ONE "file"
     part carrying exactly the file's bytes.
+  - MIOFEEDZIP1016: a .zip also goes (application/zip). Its NAME passes the text gates, its
+    content only the structural gates (PK magic, entry count, uncompressed size, ratio, no
+    absolute / .. / backslash path, no symlink, no encrypted entry, the per-entry ratio, every local
+    header name equal to the directory's, one end record); it is never extracted.
 
 Run: python3 <thisfile>   Exit 0 = all pass.
 """
@@ -26,6 +30,7 @@ import os
 import sys
 import tempfile
 import urllib.error
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.environ.get("MIO_FEED_POST") or os.path.join(os.path.dirname(HERE), "mio-feed-post.py")
@@ -162,8 +167,8 @@ def refused(label, path, needle):
     check(f"attach refused ({label}) -> names the reason", needle in err)
 
 
-refused("not .md", fpath("leiras.txt", MD), "csak .md fajl csatolhato")
-refused(".mdx is not .md", fpath("leiras.mdx", MD), "csak .md fajl csatolhato")
+refused("not .md", fpath("leiras.txt", MD), "csak .md vagy .zip fajl csatolhato")
+refused(".mdx is not .md", fpath("leiras.mdx", MD), "csak .md vagy .zip fajl csatolhato")
 refused("over the cap", fpath("nagy.md", b"a" * 1_000_001), "1000001 bajt, a plafon 1000000")
 refused("not UTF-8", fpath("bin.md", b"# x\n\xff\xfe\x00"), "nem ervenyes UTF-8")
 refused("empty", fpath("ures.md", b"  \n"), "ures csatolmany")
@@ -228,6 +233,144 @@ check("attach: the file part carries the base name and text/markdown",
 check("attach: the file part is exactly the file's bytes", fp is not None and fp.get_payload(decode=True) == raw)
 rc, out, *_ = run([CHANNEL, TITLE, BODY, "--attach", GOOD, "--confirm"], http_error=415)
 check("attach: an HTTP error -> exit 5", rc == 5 and out.startswith("HTTP 415\n"))
+
+# ---------------------------------------------------------------------------
+# 4b. MIOFEEDZIP1016: a .zip attachment. Structure only, never extracted; the
+#     text gates run on the NAME, not on the content.
+# ---------------------------------------------------------------------------
+def zpath(name, entries, mutate=None):
+    """A zip built in the temp dir. entries: list of (name, bytes) or ZipInfo pairs."""
+    p = os.path.join(tmp, name)
+    with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
+        for e in entries:
+            if isinstance(e[0], zipfile.ZipInfo):
+                z.writestr(e[0], e[1])
+            else:
+                z.writestr(e[0], e[1])
+    if mutate:
+        mutate(p)
+    return p
+
+
+ZGOOD = zpath("csomag.zip", [("skill/SKILL.md", "# Skill\n\nEgy sor \u2013 gondolatjellel, A \u2192 B, Zara irta.\n"),
+                             ("skill/scripts/run.py", "print('\u00d7')\n")])
+rc, out, err, sent, vc = run([CHANNEL, TITLE, BODY, "--attach", ZGOOD])
+check("zip: a good zip -> exit 3 (dry), names the file, bytes and sha256",
+      rc == 3 and sent == [] and "csomag.zip" in err and hashlib.sha256(open(ZGOOD, "rb").read()).hexdigest() in err)
+check("zip: the text gates do NOT run on the content (dash, arrow, agent name inside pass)", rc == 3)
+rc, out, err, sent, vc = run([CHANNEL, TITLE, BODY, "--attach", ZGOOD, "--confirm"])
+zr = sent[0] if sent else {"headers": {}, "data": b""}
+zctype = zr["headers"].get("Content-type", "")
+zmsg = email.message_from_bytes(b"Content-Type: " + zctype.encode() + b"\r\n\r\n" + (zr.get("data") or b""),
+                                policy=email.policy.HTTP)
+zparts = {p.get_param("name", header="content-disposition"): p for p in (zmsg.iter_parts() if zmsg.is_multipart() else [])}
+zf = zparts.get("file")
+check("zip: --confirm -> exit 0, one multipart request", rc == 0 and len(sent) == 1)
+check("zip: the file part is application/zip with the base name",
+      zf is not None and zf.get_content_type() == "application/zip" and zf.get_filename() == "csomag.zip")
+check("zip: the file part is exactly the zip's bytes", zf is not None and zf.get_payload(decode=True) == open(ZGOOD, "rb").read())
+rc, out, err, sent, vc = run([CHANNEL, TITLE, BODY, "--attach", GOOD, "--confirm"])
+mf = None
+if sent:
+    mm = email.message_from_bytes(b"Content-Type: " + sent[0]["headers"].get("Content-type", "").encode() + b"\r\n\r\n"
+                                  + sent[0]["data"], policy=email.policy.HTTP)
+    mf = {p.get_param("name", header="content-disposition"): p for p in mm.iter_parts()}.get("file")
+check("zip: an .md attachment is still text/markdown", mf is not None and mf.get_content_type() == "text/markdown")
+
+refused("zip: a .zip name over text bytes", fpath("hamis.zip", "nem zip\n"), "nem zip (hianyzik a PK-fejlec)")
+refused("zip: agent name in the zip's file name", zpath("Geri-csomag.zip", [("a.md", "x")]), "csatolmany: agens-nev a szovegben: Geri")
+refused("zip: over the size cap", fpath("nagy.zip", b"PK\x03\x04" + b"a" * 1_000_000), "1000004 bajt, a plafon 1000000")
+refused("zip: too many entries", zpath("sok.zip", [(f"f{i}.txt", "x") for i in range(501)]), "501 bejegyzes van, a plafon 500")
+refused("zip: compression bomb (ratio)", zpath("bomba.zip", [("nulla.bin", b"\0" * 3_000_000)]), "tomoritesi aranya")
+refused("zip: uncompressed total over the cap", zpath("ossz.zip", [("nulla.bin", b"\0" * 21_000_000)]), "kibontva 21000000 bajt, a plafon 20000000")
+refused("zip: a .. path", zpath("ut.zip", [("../kint.md", "x")]), "tiltott ut a zipben: '../kint.md'")
+refused("zip: an absolute path", zpath("abs.zip", [("/etc/kint.md", "x")]), "tiltott ut a zipben: '/etc/kint.md'")
+refused("zip: a backslash path", zpath("bs.zip", [("a\\b.md", "x")]), "tiltott ut a zipben")
+link = zipfile.ZipInfo("link")
+link.external_attr = (0o120777 << 16)
+refused("zip: a symlink entry", zpath("link.zip", [(link, "/etc/passwd")]), "symlink a zipben: 'link'")
+def set_encrypted(path):
+    """zipfile clears the encryption bit on write, so set it in the bytes: the local
+    header's flag word sits at offset 6, the central directory record's at offset 8."""
+    b = bytearray(open(path, "rb").read())
+    for sig, off in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        i = b.find(sig)
+        b[i + off] |= 0x1
+    open(path, "wb").write(bytes(b))
+
+
+refused("zip: an encrypted entry", zpath("enc.zip", [("titkos.md", "x")], mutate=set_encrypted),
+        "titkositott bejegyzes a zipben: 'titkos.md'")
+
+
+def rename_local(path):
+    """The local header says ../evil.tx while the central directory still says okfile.txt."""
+    b = bytearray(open(path, "rb").read())
+    i = b.find(b"PK\x03\x04")
+    n = int.from_bytes(b[i + 26:i + 28], "little")
+    b[i + 30:i + 30 + n] = b"../evil.tx"[:n].ljust(n, b"x")
+    open(path, "wb").write(bytes(b))
+
+
+refused("zip: a local header name that differs from the directory", zpath("local.zip", [("okfile.txt", "hello")], mutate=rename_local),
+        "local headere mas nevet visel: '../evil.tx'")
+
+
+def fake_eocd(path):
+    """The real archive (../evil.txt) carries, in its comment, a benign directory and a fake end record."""
+    import io as _io
+    good = _io.BytesIO()
+    with zipfile.ZipFile(good, "w") as z:
+        z.writestr("ok.txt", "x")
+    g = good.getvalue()
+    cd, end = g[g.find(b"PK\x01\x02"):g.find(b"PK\x05\x06")], bytearray(g[g.find(b"PK\x05\x06"):][:22])
+    b = bytearray(open(path, "rb").read())
+    e = b.find(b"PK\x05\x06")
+    end[16:20] = (e + 22).to_bytes(4, "little")
+    comment = cd + bytes(end)
+    b[e + 20:e + 22] = len(comment).to_bytes(2, "little")
+    open(path, "wb").write(bytes(b[:e + 22] + comment))
+
+
+def local_enc_only(path):
+    """The encryption bit set in the LOCAL header only; the directory says plain."""
+    b = bytearray(open(path, "rb").read())
+    i = b.find(b"PK\x03\x04")
+    b[i + 6] |= 0x1
+    open(path, "wb").write(bytes(b))
+
+
+def bad_local_offset(path):
+    """The directory entry's local-header offset points one byte past the real header."""
+    b = bytearray(open(path, "rb").read())
+    c = b.find(b"PK\x01\x02")
+    b[c + 42:c + 46] = (1).to_bytes(4, "little")
+    open(path, "wb").write(bytes(b))
+
+
+refused("zip: encryption flagged in the local header only", zpath("lenc.zip", [("titok.md", "x")], mutate=local_enc_only),
+        "titkositott bejegyzes a zipben: 'titok.md'")
+def central_enc_only(path):
+    """The encryption bit set in the central directory only; the local header says plain."""
+    b = bytearray(open(path, "rb").read())
+    c = b.find(b"PK\x01\x02")
+    b[c + 8] |= 0x1
+    open(path, "wb").write(bytes(b))
+
+
+refused("zip: encryption flagged in the directory only", zpath("cenc.zip", [("rejt.md", "x")], mutate=central_enc_only),
+        "titkositott bejegyzes a zipben: 'rejt.md'")
+refused("zip: a directory entry whose local header is missing", zpath("noloc.zip", [("a.md", "x")], mutate=bad_local_offset),
+        "local headere hianyzik")
+
+
+FAKE = zpath("fake.zip", [("../evil.txt", "x")], mutate=fake_eocd)
+check("zip: the fake-end-record fixture really fools a directory reader", [i.filename for i in zipfile.ZipFile(FAKE).infolist()] == ["ok.txt"])
+refused("zip: a second end record hidden in the comment", FAKE, "tobb end-of-central-directory rekord van")
+refused("zip: the fake directory's entry points at another local name", FAKE, "local headere mas nevet visel: '../evil.txt'")
+refused("zip: one entry over the ratio (per entry, not per archive)",
+        zpath("egy.zip", [("nulla.bin", b"\0" * 300_000)] + [(f"r{i}.bin", os.urandom(4000)) for i in range(150)]),
+        "'nulla.bin' bejegyzes tomoritesi aranya a plafon")
 
 # ---------------------------------------------------------------------------
 # 5. MIOFEEDMARVEEN1014: the two narrow exceptions
