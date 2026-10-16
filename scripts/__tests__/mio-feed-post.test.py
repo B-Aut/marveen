@@ -27,6 +27,8 @@ import hashlib
 import importlib.util
 import io
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -326,6 +328,83 @@ def trailing(path):
 
 refused("zip: bytes after the end record", zpath("tail.zip", [("a.md", "x")], mutate=trailing),
         "end-of-central-directory rekordja nem egyertelmu")
+
+
+def empty_name(path):
+    """Rebuild with one entry whose name is empty (length 0 in the local header and the directory)."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(zipfile.ZipInfo(""), "x")
+
+
+refused("zip: an empty entry name (the server answers zip_unsafe_path)",
+        zpath("ures.zip", [("a.md", "x")], mutate=empty_name), "ures bejegyzes-nev a zipben")
+
+
+def concat(path):
+    """Another zip in front: zipfile shifts the offsets and still reads it, the server does not."""
+    front, own = open(ZGOOD, "rb").read(), open(path, "rb").read()
+    open(path, "wb").write(front + own)
+
+
+refused("zip: two zips concatenated (the server answers zip_unreadable)",
+        zpath("ketto.zip", [("a.md", "x")], mutate=concat), "nem kozvetlenul az end-rekord elott er veget")
+
+
+def cd_gap(path):
+    """Bytes between the central directory and the end record (the end record keeps its offsets).
+    zipfile already refuses this one, before the end-record rule; the server accepts it."""
+    b = open(path, "rb").read()
+    q = b.rfind(b"PK\x05\x06")
+    open(path, "wb").write(b[:q] + b"\x00" * 8 + b[q:])
+
+
+refused("zip: a gap before the end record (the client stays stricter than the server)",
+        zpath("res.zip", [("a.md", "x")], mutate=cd_gap), "a zip nem olvashato")
+
+
+def zip64_tail(path):
+    """A ZIP64 end record + locator between the directory and the end record, the plain fields
+    keeping the real values: what Info-ZIP writes when it packs from stdin."""
+    b = open(path, "rb").read()
+    q = b.rfind(b"PK\x05\x06")
+    n = int.from_bytes(b[q + 10:q + 12], "little")
+    cd_size = int.from_bytes(b[q + 12:q + 16], "little")
+    cd_offset = int.from_bytes(b[q + 16:q + 20], "little")
+    rec = (b"PK\x06\x06" + (44).to_bytes(8, "little") + (45).to_bytes(2, "little") * 2
+           + (0).to_bytes(4, "little") * 2 + n.to_bytes(8, "little") * 2
+           + cd_size.to_bytes(8, "little") + cd_offset.to_bytes(8, "little"))
+    loc = b"PK\x06\x07" + (0).to_bytes(4, "little") + q.to_bytes(8, "little") + (1).to_bytes(4, "little")
+    open(path, "wb").write(b[:q] + rec + loc + b[q:])
+
+
+ZIP64T = zpath("z64.zip", [("a.md", "x")], mutate=zip64_tail)
+rc, out, err, sent, vc = run([CHANNEL, TITLE, BODY, "--attach", ZIP64T])
+check("zip: a ZIP64 end record + locator before the end record passes (exit 3)", rc == 3 and sent == [])
+
+
+def zip64_bad_locator(path):
+    """The same tail, but the locator points at bytes that are not a ZIP64 end record."""
+    zip64_tail(path)
+    b = bytearray(open(path, "rb").read())
+    q = b.rfind(b"PK\x05\x06")
+    b[q - 12:q - 4] = (0).to_bytes(8, "little")
+    open(path, "wb").write(bytes(b))
+
+
+# Refused either way: some zipfile versions already reject the locator (a zip nem olvashato), and
+# where zipfile tolerates it, the directory-end rule does.
+rc, out, err, sent, vc = run([CHANNEL, TITLE, BODY, "--attach",
+                              zpath("z64rossz.zip", [("a.md", "x")], mutate=zip64_bad_locator), "--confirm"])
+check("zip: a locator that points at no ZIP64 end record is refused, nothing sent",
+      rc == 1 and sent == [] and vc == []
+      and ("nem kozvetlenul az end-rekord elott er veget" in err or "a zip nem olvashato" in err))
+if shutil.which("zip"):
+    ZSTDIN = os.path.join(tmp, "stdin.zip")
+    subprocess.run(["zip", "-q", ZSTDIN, "-"], input=b"x\n", check=True)
+    rc, out, err, sent, vc = run([CHANNEL, TITLE, BODY, "--attach", ZSTDIN])
+    check("zip: an Info-ZIP zip packed from stdin passes (exit 3)", rc == 3 and sent == [])
+else:
+    print("SKIP zip: no Info-ZIP on this host, the stdin case runs only on the hand-built record")
 
 import io as _io
 _inner = _io.BytesIO()
