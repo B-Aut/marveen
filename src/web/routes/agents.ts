@@ -2354,6 +2354,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     if (isMainChannelsAgent(name)) {
       // A kezi restart nem vagja el a futo turnt. Beragadt fo-agensnel csak explicit {"force": true} atlepi a kaput.
       const force = wantsForceRestart(await readBody(req))
+      if (force) logger.warn({ route: '/api/agents/:name/restart' }, 'manual main restart forced past the pane gate')
       if (!force) {
         const gate = await gateManualRestart(MAIN_CHANNELS_SESSION)
         if (!gate.allow) { json(res, { error: 'restart-blocked', reason: gate.reason, hint: MANUAL_RESTART_FORCE_HINT }, 409); return true }

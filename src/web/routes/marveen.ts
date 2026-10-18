@@ -164,7 +164,7 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
   if (path === '/api/marveen/restart' && method === 'POST') {
     // A kezi restart nem vagja el a futo turnt. Beragadt fo-agensnel csak explicit {"force": true} atlepi a kaput.
     const force = wantsForceRestart(await readBody(req))
-    if (force) logger.warn('manual main restart forced past the pane gate')
+    if (force) logger.warn({ route: '/api/marveen/restart' }, 'manual main restart forced past the pane gate')
     if (!force) {
       const gate = await gateManualRestart(MAIN_CHANNELS_SESSION)
       if (!gate.allow) { json(res, { error: 'restart-blocked', reason: gate.reason, hint: MANUAL_RESTART_FORCE_HINT }, 409); return true }
