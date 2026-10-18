@@ -1140,9 +1140,11 @@ refresh_one_seed_file() {
 }
 
 # Refresh one seeded directory tree. $1 = repo source dir (relative), $2 = target
-# root, $3 = verbatim|template.
+# root, $3 = verbatim|template, $4 = which subdirs ship: "references" (a task's
+# references/ only, the default) or "all" (every subdir: a skill's scripts/,
+# references/, ...; SEEDSKILLSUB1018).
 refresh_untouched_seeds() {
-  src_rel="$1"; target_root="$2"; mode="${3:-verbatim}"
+  src_rel="$1"; target_root="$2"; mode="${3:-verbatim}"; subdirs="${4:-references}"
   [ -d "$INSTALL_DIR/$src_rel" ] || return 0
   [ -d "$target_root" ] || return 0
   for d in "$INSTALL_DIR/$src_rel"/*/; do
@@ -1162,25 +1164,37 @@ refresh_untouched_seeds() {
     # SKILL.md is now byte-identical to the shipped one -- that copy runs our
     # text, and our text points at the file. A locally edited SKILL.md is the
     # operator's, so its directory gets nothing added.
-    [ -d "${d}references" ] || continue
     skill_current=0
     if [ -f "${d}SKILL.md" ] && [ -f "$target_root/$name/SKILL.md" ]; then
       want="$(render_seed_file "${d}SKILL.md" "$mode" | shasum -a 256 | awk '{print $1}')"
       have="$(shasum -a 256 <"$target_root/$name/SKILL.md" | awk '{print $1}')"
       [ "$want" = "$have" ] && skill_current=1
     fi
-    for f in "${d}references/"*; do
+    # Subdir files: the TRACKED ones only, the same set the seed loops copy
+    # (an untracked or ignored file can be a secret; SEEDSKILLSUB1018). Read
+    # into a variable first: the loop body must update the counters in THIS
+    # shell, not in a pipeline subshell.
+    tracked="$(git -C "$d" ls-files 2>/dev/null)"
+    while IFS= read -r rel; do
+      case "$rel" in */*) ;; *) continue ;; esac
+      [ "$subdirs" = "all" ] || case "$rel" in references/*) ;; *) continue ;; esac
+      f="$d$rel"
       [ -f "$f" ] || continue
-      base="$(basename "$f")"
-      installed="$target_root/$name/references/$base"
+      installed="$target_root/$name/$rel"
       if [ -f "$installed" ]; then
-        refresh_one_seed_file "$f" "$installed" "$src_rel/$name/references/$base" "$mode"
+        refresh_one_seed_file "$f" "$installed" "$src_rel/$name/$rel" "$mode"
       elif [ "$skill_current" = "1" ]; then
-        mkdir -p "$target_root/$name/references"
-        render_seed_file "$f" "$mode" >"$installed.seedtmp" && mv "$installed.seedtmp" "$installed"
+        mkdir -p "$(dirname "$installed")"
+        if [ "$mode" = "template" ]; then
+          render_seed_template <"$f" >"$installed.seedtmp" && mv "$installed.seedtmp" "$installed"
+        else
+          cp -p "$f" "$installed"   # verbatim keeps the mode bits (a skill's scripts)
+        fi
         SEED_REFRESH_UPDATED=$((SEED_REFRESH_UPDATED + 1))
       fi
-    done
+    done <<EOF_TRACKED
+$tracked
+EOF_TRACKED
   done
   return 0
 }
@@ -1199,7 +1213,7 @@ run_seed_refresh() {
     OWNER_NAME="${OWNER_NAME:-$(sed -n 's/^OWNER_NAME=//p' "$INSTALL_DIR/.env" | head -1 | tr -d '"')}"
     WEB_PORT="${WEB_PORT:-$(sed -n 's/^WEB_PORT=//p' "$INSTALL_DIR/.env" | head -1 | tr -d '"')}"
   fi
-  refresh_untouched_seeds "seed-skills" "$HOME/.claude/skills" "verbatim"
+  refresh_untouched_seeds "seed-skills" "$HOME/.claude/skills" "verbatim" "all"
   if [ -n "${MAIN_AGENT_ID:-}" ]; then
     refresh_untouched_seeds "seed-scheduled-tasks" "$HOME/.claude/scheduled-tasks" "template"
     # SEEDREFRESH826: the TOP-LEVEL scheduled-tasks/ dir (dream-engine,
@@ -1455,6 +1469,17 @@ if [ -d "$SEED_SKILLS_DIR" ]; then
     for f in "$skill_dir"*; do
       [ -f "$f" ] || continue
       cp "$f" "$target/$(basename "$f")"
+    done
+    # SEEDSKILLSUB1018: a skill's subdirs (scripts/, references/, ...) ship too,
+    # verbatim and with their mode bits; its SKILL.md points into them.
+    # Only the files git TRACKS: a whole-dir copy also carried untracked and
+    # ignored files, and fleet-helper's own scripts/.gitignore names exactly
+    # those as secrets/personal data (mail_rules.json, .dashboard-token).
+    # Outside a git checkout nothing below the top level is copied.
+    git -C "$skill_dir" ls-files -z 2>/dev/null | while IFS= read -r -d '' rel; do
+      case "$rel" in */*) ;; *) continue ;; esac   # top-level files: the loop above
+      mkdir -p "$target/$(dirname "$rel")"
+      cp -p "$skill_dir$rel" "$target/$rel"
     done
     if [ "$forced" = "1" ]; then SEED_FORCED=$((SEED_FORCED + 1)); else SEED_NEW=$((SEED_NEW + 1)); fi
   done
