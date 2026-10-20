@@ -43,6 +43,8 @@ level 1  → csak listázza/jelzi, semmit nem tesz
 
 Hiányzó, olvashatatlan config vagy hiányzó kulcs esetén a default az 1. szint (csak jelez): ugyanaz, amit a `seed-config` minden kategóriára szállít. Így egy törölt vagy sérült config nem a legmegengedőbb szintre billenti a feladatot. (A levélkapu, `scripts/hooks/email-approval-gate.py`, ugyanerre a 2. szintet adja: ott a kimenő levél jóváhagyással még elmehet.)
 
+A legtöbb szintet az ágens promptja olvassa. Kettőt a szerver vagy egy hook is kikényszerít: az `email_send`-et a levélkapu (`scripts/hooks/email-approval-gate.py`), a `data_delete`-et a memória-törlés végpontja (`DELETE /api/memories/:id`, 3-as szint alatt csak jóváhagyott, egyszer felhasználható azonosítóval; lásd `docs/security-hardening.md`).
+
 ### Config-séma
 
 ```json
