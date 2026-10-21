@@ -228,7 +228,10 @@ def owner_cc_missing(tool_input: dict, owner: str) -> bool:
 # The pre-classifier send-name test, kept ONLY for owner_cc_scope when the
 # extractor does not load (classify_tool -> "unclassified"), so a broken
 # email_extract.py cannot switch the owner-CC check off at level 3.
-_OWNER_CC_SEND_FALLBACK = re.compile(r"send_email|gmail__(reply|reply_all|send_message|forward)$", re.I)
+# send_mail(_auto)$: the harder-mail sends (HARDERMAILGATES1019), the suffix
+# classify_mail_tool gates them by.
+_OWNER_CC_SEND_FALLBACK = re.compile(
+    r"send_email|gmail__(reply|reply_all|send_message|forward)$|send_mail(_auto)?$", re.I)
 
 
 def owner_cc_scope(tool: str, kind, tool_input: dict):
@@ -382,6 +385,12 @@ def standing_match(env: dict, standing):
     to exactly one known address falls through to the approval path -- never to
     an allow."""
     if not standing:
+        return None
+    # A harder-mail reply is addressed by its original (reply_to), not by `to`:
+    # the `to` the envelope holds is then a made-up anchor token, and an address
+    # typed into reply_folder / reply_to_uid parses out of it as a recipient
+    # (security review of HARDERMAILGATES1019). Such a letter is never on the list.
+    if env.get("reply_to"):
         return None
     for field in ("cc", "bcc"):
         if any(str(v).strip() for v in (env.get(field) or [])):
@@ -609,6 +618,12 @@ def content_anchor(env: dict) -> str:
         fields["html_sha256"] = env["html_sha256"]
     if env.get("attachments"):
         fields["attachments"] = env["attachments"]
+    # HARDERMAILGATES1019: a harder-mail send names its account (the From), a
+    # non-plain body_format and, for a reply, the original message; they join
+    # the canon only when present, so every other anchor stays byte-identical.
+    for key in ("account", "reply_to", "body_format"):
+        if env.get(key):
+            fields[key] = env[key]
     canon = json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
@@ -1060,6 +1075,12 @@ def summarize(env: dict) -> str:
         extra += f" | HTML sha256: {env['html_sha256'][:16]}"
     if env.get("attachments"):
         extra += " | Csatolmany: " + ", ".join(f"{a['name']} ({a['sha256'][:16]})" for a in env["attachments"])
+    if env.get("account"):
+        extra += f" | Fiok: {env['account']}"
+    if env.get("body_format"):
+        extra += f" | Formatum: {env['body_format']}"
+    if env.get("reply_to"):
+        extra += f" | Valasz erre: {env['reply_to'][0]} / uid {env['reply_to'][1]}"
     return f"Cimzett: {to} | CC: {cc} | Szoveg eleje: {head}{extra}"
 
 
