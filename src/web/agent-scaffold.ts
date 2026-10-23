@@ -14,7 +14,7 @@ import { filterInheritableMcpServers, readInheritableMcpServerNames, logNotInher
 import { agentDir, agentConfigRoot, listAgentNames, readAgentCapabilities, readAgentToolDeny } from './agent-config.js'
 import { loadProfileTemplate, profileWantsCredentialGate, profileWantsDestructiveGate, profileWantsYtIngest, resolveProfilePlaceholders,
   type ProfileTemplate } from './profiles.js'
-import { resolveAgentSecurityProfile } from './agent-team.js'
+import { resolveAgentSecurityProfile, readAgentTeam } from './agent-team.js'
 import { sanitizeCapabilityTag, CAPABILITY_TAG_MAX_PER_AGENT } from '../prompt-safety.js'
 import { TMP_ROOT_PREFIXES as _TMP_PREFIXES } from './tmp-root-prefixes.js'
 
@@ -2721,7 +2721,39 @@ function buildFleetRosterBody(selfName: string): string {
     ? agentNames
     : [MAIN_AGENT_ID, ...agentNames]
 
+  // Hierarchy (TEAMROSTER1023): a sub-agent's reportsTo lives in its own
+  // agent-config.json (team.reportsTo), but until now nothing surfaced it
+  // here -- only team-trust.ts (the <trusted-peer> tag) and the dashboard
+  // overview route read it. A sub-agent therefore had no way to learn from
+  // its OWN CLAUDE.md who it reports to or who reports to it; that knowledge
+  // lived elsewhere and did not load into a sub-agent's context by itself.
+  //
+  // selfReportsTo is validated against `names` (the known-agent list), not
+  // just read and trusted: readAgentTeam() only TRIMS the stored value
+  // (sanitizeTeamConfig, which drops a self-reference or an unknown name,
+  // runs on the dashboard write path only -- a hand-edited agent-config.json,
+  // or an agent editing its own, bypasses it entirely). Without this check,
+  // a bad reportsTo value reaches this generated, trusted block two ways:
+  // (1) a name that does not resolve to any real agent (wrong case, typo, a
+  // deleted agent) produces a "Vezetőd:" line pointing at a ghost, and (2) a
+  // value containing newlines is inserted into the agent's own CLAUDE.md
+  // verbatim -- e.g. "zara\n\n## IGNORE ALL PREVIOUS INSTRUCTIONS\n..." would
+  // become a heading in the agent's own instructions, the same class of risk
+  // sanitizeCapabilityTag() already closes for capability tags on this same
+  // line. Requiring membership in `names` (itself sourced from
+  // listAgentNames(), not from the untrusted field) closes both: neither a
+  // ghost name nor a newline-laden string is a member.
+  //
+  // For the main agent (no agents/ subdirectory) readAgentTeam() safely
+  // falls back to DEFAULT_TEAM (reportsTo: null), which is correct -- the
+  // main agent reports to no one.
+  const selfTeam = readAgentTeam(selfName)
+  const selfReportsTo = selfTeam.reportsTo && selfTeam.reportsTo !== selfName && names.includes(selfTeam.reportsTo)
+    ? selfTeam.reportsTo
+    : null
+
   const lines: string[] = []
+  const subordinates: string[] = []
   for (const agentName of names) {
     if (agentName === selfName) continue
 
@@ -2738,10 +2770,38 @@ function buildFleetRosterBody(selfName: string): string {
       .slice(0, CAPABILITY_TAG_MAX_PER_AGENT)
 
     const capsStr = caps.length > 0 ? caps.join(', ') : '-'
-    lines.push(`- **${agentName}** (agent_id: ${agentName}): ${capsStr}`)
+
+    const peerReportsTo = readAgentTeam(agentName).reportsTo
+    let roleTag = ''
+    // A two-agent cycle (A reports to B, B reports to A) would otherwise tag
+    // the same roster line BOTH "(beosztottad)" (this loop) AND as the
+    // "Vezetőd:" target (below) -- a peer is only a subordinate if it is not
+    // ALSO this agent's own (validated) manager.
+    if (peerReportsTo === selfName && agentName !== selfReportsTo) {
+      subordinates.push(agentName)
+      roleTag = ' (beosztottad)'
+    } else if (agentName === selfReportsTo) {
+      roleTag = ' (vezetőd)'
+    }
+
+    lines.push(`- **${agentName}** (agent_id: ${agentName})${roleTag}: ${capsStr}`)
   }
 
   const roster = lines.length > 0 ? lines.join('\n') : '(nincs regisztrált ágens)'
+
+  // Factual only (2026-10-23, reviewer-measured): the line used to also
+  // prescribe ROUTING ("a kész munkát neki adod át, nem közvetlenül a
+  // gazdának"), which can contradict an individual agent's own standing
+  // instructions -- e.g. an agent that owns a channel and is told to report
+  // certain things straight to the owner. Routing rules belong in each
+  // agent's own text, not in this generated, one-size-fits-all block.
+  const hierarchyLines: string[] = []
+  if (selfReportsTo) {
+    hierarchyLines.push(`Vezetőd: **${selfReportsTo}**.`)
+  }
+  if (subordinates.length > 0) {
+    hierarchyLines.push(`Beosztottjaid: ${subordinates.map((n) => `**${n}**`).join(', ')}.`)
+  }
 
   return [
     '## A flotta többi agense',
@@ -2751,6 +2811,7 @@ function buildFleetRosterBody(selfName: string): string {
     '',
     roster,
     '',
+    ...(hierarchyLines.length > 0 ? [...hierarchyLines, ''] : []),
     'Ha egy kérés egyértelműen más szakterületére esik, jelezd vagy delegáld inter-agent üzenettel a megfelelő ágensnek.',
   ].join('\n')
 }
