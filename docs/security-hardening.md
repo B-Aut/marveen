@@ -600,3 +600,61 @@ the vault, scheduled tasks) still writes with the same shared token, and on a
 single-user host an agent whose Bash is permissive can write `.env` directly.
 Closing those needs the per-agent identity decision (#1985) and per-agent OS
 users, not this filter.
+
+# Sub-agent mail gate: sender scripts under any name
+
+`scripts/email-send-gate.mjs` (sub-agents only) denies every Bash send it
+recognises. `isSendInvocation` recognises a Python sender only by the name
+`send.py`, so a self-written SMTP script under any other name
+(`python3 helden_send.py --to x@y < body.txt`) was no send for it.
+
+`gateDecision` therefore also runs `scriptRunSends` on the Bash path
+(SCRIPTSENDGATE1020). A run is a send when:
+
+- **An address flag.** An interpreter (python, node, tsx, bun, deno) or a
+  directly executed script is given an e-mail address after `--to`, `--cc` or
+  `--bcc`. This also holds when no script file is named (`python3 -m pkg`,
+  `python3 -c ...`). A Telegram chat id after `--to` is not an address.
+- **A mail-library import in the script.** The script file is resolved against
+  the hook payload `cwd` and read up to 1 MiB. It imports a mail library:
+  - an `import` / `from ... import` of `smtplib`, `aiosmtplib` or `yagmail`
+    (or `importlib.import_module` of one) in a python script;
+  - a `require` / `import` of `nodemailer` in a node script.
+
+  A bare mention of the name is no import: a comment, a mock
+  (`send.smtplib.SMTP_SSL = ...`) or a regex. So this gate's own source, a test
+  that mocks the library and a config that names it are not denied.
+- **A helper that imports one.** One level of local helper modules imports a
+  mail library. Helpers are the modules the script imports, resolved next to
+  it (`from mailhelper import send_mail` reads `mailhelper.py`; `./mh.js` for
+  node).
+- **A shell `-c` string.** The string of `sh`, `bash`, `zsh` or `dash -c`
+  (also `-lc`, `-ec`) runs one of the above.
+
+A directly executed file (`./x`, `/abs/x`, `x.py`) is read as python or node by
+its `#!` line (`#!/usr/bin/env python3`, `#!/usr/bin/env -S node`), else by its
+extension. An extensionless file without a python or node `#!` line is not
+judged.
+
+The check is deliberately not part of `isSendInvocation`. That function is the
+contract shared with the main agent's Python gates (`send-invocation-cases.json`),
+and the main agent's `email_send` approval gate keeps its current reach.
+
+**Known limits.** These are allowed, so do not read the gate as complete:
+
+- **Mail sent without one of these libraries:**
+  - the Gmail API client (`users().messages().send`);
+  - an HTTP mail API through `requests.post` or `fetch`;
+  - raw `socket` / `ssl` SMTP;
+  - `perl` Net::SMTP and `ruby` net/smtp.
+- **Script sources the gate does not read:**
+  - a script read from stdin (`python3 < smtp_send.py`);
+  - a script path through a variable (`"$PWD/x.py"`, `$S`);
+  - a module run with `-m` and no address flag;
+  - an import after the first 1 MiB of the file.
+- **Reach:**
+  - helpers past the first level;
+  - a script started after `cd dir &&`, which is resolved against the session
+    cwd, not `dir`;
+  - a missing file, which is judged on its arguments alone;
+  - code assembled at runtime.
