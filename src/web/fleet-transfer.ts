@@ -15,12 +15,12 @@ import { homedir, hostname } from 'node:os'
 import {
   randomBytes, createCipheriv, createDecipheriv, scryptSync,
 } from 'node:crypto'
-import { PROJECT_ROOT, STORE_DIR, MAIN_AGENT_ID, BOT_NAME, BRAND_NAME, OWNER_NAME, CHANNEL_PROVIDER } from '../config.js'
+import { PROJECT_ROOT, STORE_DIR, MAIN_AGENT_ID, BOT_NAME, BRAND_NAME, OWNER_NAME, CHANNEL_PROVIDER, RESERVED_AGENT_IDS } from '../config.js'
 import { channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { updateEnvFile } from '../env.js'
 import { AGENTS_BASE_DIR, listAgentNames, readJsonObjectForWrite } from './agent-config.js'
-import { RESERVED_AGENT_IDS, safeJoin, sanitizeAgentName } from './sanitize.js'
+import { safeJoin, sanitizeAgentName } from './sanitize.js'
 import { importedLabelColor } from '../css-color.js'
 import { SCHEDULED_TASKS_DIR, type ScheduledTaskWritten } from './scheduled-tasks-io.js'
 import { registerScheduledTask } from './schedule-registry.js'
@@ -894,6 +894,13 @@ function validateNames(fleet: FleetJson): string[] {
   for (const agent of fleet.agents ?? []) {
     if (!SAFE_NAME_RE.test(String(agent.name ?? ''))) {
       errors.push(`Érvénytelen agent.name: "${String(agent.name).slice(0, 60)}"`)
+    }
+    // FLEETRESERVEDNAME1021 + VOICECHANNELID1022: a sub-agent under an id the
+    // message layer owns (the voice channel id in effect included) could not
+    // send, or would be framed as something it is not -- refused here like in
+    // POST /api/agents and the agent bundle import.
+    if (RESERVED_AGENT_IDS.includes(String(agent.name ?? ''))) {
+      errors.push(`Reserved agent.name: "${String(agent.name).slice(0, 60)}" is reserved by the system`)
     }
     // B1: avatarExt defense-in-depth guard (primary enforcement in writeAgentFiles)
     if (agent.avatar && agent.avatarExt !== undefined &&
