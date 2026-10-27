@@ -1367,10 +1367,16 @@ export type PreCheckResult = { skip: boolean; prefix?: string }
 export const PRECHECK_TIMEOUT_MS = 10_000
 // Ceiling for the per-task override below. The cron loop AWAITS the pre-check
 // under the tickRunning guard, so a slow script does not block the event loop
-// any more (runPreCheckAsync) but it still holds the NEXT tick: the limit is
-// how late every other task on that tick can be made. 60 s is one tick's worth
-// and leaves room for an ssh ConnectTimeout 15 + query; anything slower is a
-// job, not a gate, and belongs behind a state file the gate only reads.
+// any more (runPreCheckAsync) but it still holds the NEXT tick.
+//
+// The ceiling is PER TASK, and the tick awaits the gates ONE AFTER ANOTHER, so
+// what a task at the end of a tick actually waits for is the SUM of the gates
+// before it -- not 60 s (review note on #2300). Treat the ceiling as a bound on
+// a single bad gate, not on the tick. Several network-crossing pre-checks due
+// in the same minute is a scheduling decision to make deliberately, and the
+// cheap way out of it is a gate that reads a state file somebody else refreshes.
+// 60 s leaves room for an ssh ConnectTimeout 15 plus the query; anything slower
+// is a job, not a gate.
 export const PRECHECK_MAX_TIMEOUT_MS = 60_000
 // Floor: a sub-second limit kills every real script and turns the gate into a
 // pure cost (fail-open after a spawn), which is worse than having no gate.
@@ -1378,7 +1384,8 @@ export const PRECHECK_MIN_TIMEOUT_MS = 1_000
 
 // A task's pre-check time limit. Same clamp shape as resolveStuckTimeoutMs: an
 // unset/invalid/non-positive value takes the default, a configured one is
-// pinned into [PRECHECK_MIN_TIMEOUT_MS, maxMs].
+// pinned into [PRECHECK_MIN_TIMEOUT_MS, maxMs]. Per task -- see the note on
+// PRECHECK_MAX_TIMEOUT_MS for what that does NOT bound.
 //
 // Why this is configurable at all: at the fixed 10 s a pre-check that crosses
 // the network is killed on every tick and fails open, so the gate costs a
